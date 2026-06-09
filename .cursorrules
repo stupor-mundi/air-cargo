@@ -1,0 +1,152 @@
+# air-cargo
+
+## Project Overview
+Air cargo flight tracking and trade flow inference system.
+Polls ADS-B data from OpenSky Network to track cargo aircraft,
+detect anomalous behaviour, and infer freight trade flows.
+
+## Repository Structure
+air-cargo/
+├── adsb-collector/    OpenSky REST polling → Kafka
+├── adsb-analyser/     Flink + SedonaFlink, detection + inference
+├── common/            Shared models, constants, enums
+├── reference-data/    Airport, operator reference data scripts
+└── k8s/               K3s deployment manifests
+
+## Language and Build
+- Java 17
+- Maven, no parent pom — each module independent
+- Do not suggest Gradle, Kotlin, or Spring Boot
+
+## Core Technology Stack
+- Apache Flink — stream processing
+- Apache SedonaFlink — spatial operations on Flink streams
+- Redpanda — Kafka-compatible broker (refer to as Kafka in code)
+- PostgreSQL + PostGIS — spatial reference layers + JSONB state
+- OkHttp — HTTP client for OpenSky polling
+- Jackson — JSON serialisation
+- Protobuf — internal Kafka event topics only
+
+## OpenSky Network API
+Base URL: https://opensky-network.org/api
+Authentication: OAuth2 client credentials
+  - client_id and client_secret from environment variables
+  - Bearer token, expires every 30 minutes
+  - TokenManager class handles automatic refresh
+
+Key endpoints:
+  GET /states/all
+    - current state vectors, or up to 1hr past (authenticated)
+    - optional: time (unix), icao24, bounding box, extended=1
+    - filter by bounding box: lamin, lomin, lamax, lomax
+    - returns JSON with time + states array
+
+  GET /flights/aircraft
+    - flights for specific icao24, max 2 day window
+    - updated nightly — previous day or earlier only
+
+  GET /flights/arrival
+  GET /flights/departure
+    - by airport ICAO code, max 2 day window
+
+Polling interval: every 10 seconds for /states/all
+Token refresh: proactively before 30 minute expiry
+On startup catch-up: query /states/all with time=now-3600
+
+## State Vector Field Indices
+OpenSky returns states as arrays — deserialise by index:
+  0:  icao24          hex string, unique transponder address
+  1:  callsign        8 chars, nullable
+  2:  origin_country  inferred from icao24
+  3:  time_position   unix timestamp last position, nullable
+  4:  last_contact    unix timestamp last contact
+  5:  longitude       WGS-84 decimal degrees, nullable
+  6:  latitude        WGS-84 decimal degrees, nullable
+  7:  baro_altitude   metres, nullable
+  8:  on_ground       boolean
+  9:  velocity        m/s over ground, nullable
+  10: true_track      degrees clockwise from north, nullable
+  11: vertical_rate   m/s positive=climbing, nullable
+  12: sensors         receiver IDs, nullable
+  13: geo_altitude    metres, nullable
+  14: squawk          transponder code, nullable
+  15: spi             special purpose indicator boolean
+  16: position_source 0=ADS-B 1=ASTERIX 2=MLAT 3=FLARM
+  17: category        only present when extended=1
+
+## Aircraft Categories (extended=1)
+  4: Large (75,000-300,000 lbs)
+  5: High Vortex Large (B-757 class)
+  6: Heavy (> 300,000 lbs) — primary interest
+
+## Kafka Topics
+  adsb.states          JSON, raw from OpenSky
+  events.anomalies     Protobuf
+  events.watchlist     Protobuf
+  events.trade_flows   Protobuf
+
+## Serialisation
+- adsb.states: JSON only — preserve raw OpenSky data
+- Internal event topics: Protobuf
+- Document state: PostgreSQL JSONB
+- Never transcode raw OpenSky data to Protobuf
+
+## Key Identifiers
+ICAO24: permanent aircraft identifier, primary key throughout
+Callsign: changes per flight, not reliable as identifier
+Registration: tail number, links to external registries
+
+## adsb-analyser — Flink Processing
+- StreamExecutionEnvironment with SedonaFlink registered
+- Always use event time from OpenSky timestamps
+- Never use processing time
+- RocksDB state backend
+- Watermark lag: ~60 seconds
+
+## Two-Tier State
+Hot (RocksDB):
+  TTL 48-72 hours no contact
+  Watchlisted aircraft: TTL suppressed
+  On TTL expiry: write snapshot to PostgreSQL
+
+Cold (PostgreSQL JSONB):
+  Long-term history, rehydrate into RocksDB on reappearance
+
+## PostgreSQL JSONB Collections
+  aircraft        per-aircraft state and history
+  watchlist       tracked aircraft + uncertainty state
+  trade_flows     inferred cargo movement events
+  anomaly_history scored events
+
+## PostGIS Reference Layers
+  airports            point + polygon, ICAO codes
+  cargo_terminals     cargo ramp areas within airports
+  airspace_boundaries FIR boundaries, restricted zones
+
+## Spatial Operations
+- ST_DistanceSphere for distance calculations
+- Coordinates WGS-84 (EPSG:4326) throughout
+- OpenSky returns longitude first, then latitude
+  be explicit when constructing Sedona geometry points
+- Broadcast state pattern for airport/airspace lookups
+
+## Anomaly Scoring
+- Fuzzy 0.0-1.0 confidence scores, not binary thresholds
+- Scores accumulate in per-aircraft Flink state
+- Alert only when score sustained above threshold over time
+
+## Design Decisions
+- Flink for stateful streaming and event-time correctness
+- Raw JSON preserved in Kafka
+- JSONB in PostgreSQL — no MongoDB
+- Independent Maven modules — no parent pom
+- Observational language throughout — never judgemental
+- Do not fetch external URLs autonomously
+- If documentation needed, ask user to provide the section
+
+## Current State
+Planning complete. No code written yet.
+First task: exploratory adsb-collector — connect to OpenSky,
+poll /states/all, print raw responses to console, understand
+field population and nullability before wiring Kafka.
+
