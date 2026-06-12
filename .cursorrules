@@ -150,3 +150,48 @@ First task: exploratory adsb-collector — connect to OpenSky,
 poll /states/all, print raw responses to console, understand
 field population and nullability before wiring Kafka.
 
+## Kafka Retention
+30-day local retention on Redpanda. Deliberate architectural
+decision — enables replaying historical events through
+different algorithm versions during development, without
+waiting for live recurrence of interesting events
+(e.g. tanker disappearances, route anomalies).
+
+## Adaptive Polling Strategy
+adsb-collector polling is two-tier and dynamic, not fixed-interval:
+
+Tier 1 — Discovery sweep:
+  Global /states/all query every 10-15 minutes
+  Identifies candidate aircraft of interest
+  Adds candidates to watchlist
+
+Tier 2 — Watchlist tracking:
+  Higher frequency queries for flagged aircraft
+  Interval tightens dynamically on events:
+    - Tanker airborne → add to watchlist, increase frequency
+    - Unusual route detected → add to watchlist
+    - Aircraft disappears → maximum frequency on last known area
+    - Aircraft reappears → capture precisely, then relax frequency
+
+Collector reads watchlist from PostgreSQL or a dedicated Kafka
+topic and adjusts query parameters accordingly.
+
+Credit budget target:
+  ~400 credits/day for discovery sweep (global, every 10-15 min)
+  ~3,600 credits/day available for watchlist tracking
+
+## Aircraft Metadata Reference Table
+PostgreSQL table mapping icao24 → aircraft type, registration,
+operator, manufacturer. Write-once, rarely-update reference data
+(physical airframe attributes do not change).
+
+Sources, in order:
+  1. FAA registry CSV (free bulk download, daily updated)
+  2. OpenSky aircraft database CSV (free download)
+  3. planespotters.net API (free tier, for gaps only,
+     result cached permanently — never re-queried)
+
+Reload FAA + OpenSky CSVs periodically (weekly) via script
+in reference-data/. This enrichment consumes zero OpenSky
+API credits — credits reserved entirely for /states/all
+polling.
