@@ -28,7 +28,7 @@ public class AdsbCollectorMain {
     private static final String TOKEN_URL =
             "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
     private static final String STATES_URL =
-            "https://opensky-network.org/api/states/all";
+            "https://opensky-network.org/api/states/all?extended=1";
     private static final String TOPIC = "adsb.states";
     private static final long POLL_INTERVAL_MINUTES = 10;
     private static final long TOKEN_REFRESH_MINUTES = 25;
