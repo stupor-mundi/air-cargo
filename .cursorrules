@@ -401,3 +401,10 @@ stored in airports.properties JSONB column.
 
 Always use Plan mode unless explicitly instructed otherwise.
 Do not switch to Agent mode autonomously.
+
+
+Jackson must be pinned to 2.14.2 to match Flink 1.19's shaded Jackson — do not upgrade to 2.17.x
+
+adsb.tracks confirmed working, ~8,150 messages per poll cycle
+
+Next milestone: wire FlightStateMachine, create adsb.plane_state topic
