@@ -2,7 +2,7 @@ package io.aircargo.analyser;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.aircargo.analyser.model.AircraftPosition;
+import io.aircargo.common.model.AircraftPosition;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
@@ -110,19 +110,19 @@ public class AdsbAnalyserMain {
                 pos.setLastContact(longOrNull(stateNode, 4));
                 pos.setLongitude(longitude);
                 pos.setLatitude(latitude);
-                pos.setBaroAltitude(doubleOrNull(stateNode, 7));
+                pos.setBaroAltitudeM(doubleOrNull(stateNode, 7));
                 pos.setOnGround(boolOrNull(stateNode, 8));
-                pos.setVelocity(doubleOrNull(stateNode, 9));
-                pos.setTrueTrack(doubleOrNull(stateNode, 10));
-                pos.setVerticalRate(doubleOrNull(stateNode, 11));
+                pos.setVelocityMs(doubleOrNull(stateNode, 9));
+                pos.setHeadingDeg(doubleOrNull(stateNode, 10));
+                pos.setVerticalRateMs(doubleOrNull(stateNode, 11));
                 // index 12: sensors — skipped
-                pos.setGeoAltitude(doubleOrNull(stateNode, 13));
+                pos.setGeoAltitudeM(doubleOrNull(stateNode, 13));
                 pos.setSquawk(textOrNull(stateNode, 14));
                 pos.setSpi(boolOrNull(stateNode, 15));
                 pos.setPositionSource(intOrNull(stateNode, 16));
                 // index 17: category — only present when extended=1
                 pos.setCategory(intOrNull(stateNode, 17));
-                pos.setSnapshotTime(snapshotTime);
+                pos.setSnapshotTimeMs(snapshotTime != null ? snapshotTime * 1000L : null);
 
                 out.collect(pos);
             }
