@@ -4,6 +4,8 @@
 Air cargo flight tracking and trade flow inference system.
 Polls ADS-B data from OpenSky Network to track cargo aircraft,
 detect anomalous behaviour, and infer freight trade flows.
+Companion learning project — builds Flink, SedonaFlink, 
+and Kafka skills before returning to maritime AIS work.
 
 ## Repository Structure
 air-cargo/
@@ -17,6 +19,8 @@ air-cargo/
 - Java 17
 - Maven, no parent pom — each module independent
 - Do not suggest Gradle, Kotlin, or Spring Boot
+- Do not fetch external URLs autonomously
+- If documentation needed, ask user to provide the section
 
 ## Core Technology Stack
 - Apache Flink — stream processing
@@ -27,171 +31,338 @@ air-cargo/
 - Jackson — JSON serialisation
 - Protobuf — internal Kafka event topics only
 
+## Infrastructure
+Single node — Minisforum CachyOS.
+No cloud dependency. No always-on requirement.
+Collector runs whenever Minisforum is on.
+Quality of results proportional to uptime — accepted limitation.
+
 ## OpenSky Network API
 Base URL: https://opensky-network.org/api
 Authentication: OAuth2 client credentials
   - client_id and client_secret from environment variables
+    OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET
   - Bearer token, expires every 30 minutes
-  - TokenManager class handles automatic refresh
+  - Refresh proactively at 25 minutes
 
 Key endpoints:
-  GET /states/all
-    - current state vectors, or up to 1hr past (authenticated)
-    - optional: time (unix), icao24, bounding box, extended=1
-    - filter by bounding box: lamin, lomin, lamax, lomax
-    - returns JSON with time + states array
+  GET /states/all?extended=1
+    - current state vectors
+    - up to 1hr past with time parameter (authenticated)
+    - optional bounding box: lamin, lomin, lamax, lomax
+    - extended=1 adds category field (index 17)
 
-  GET /flights/aircraft
-    - flights for specific icao24, max 2 day window
-    - updated nightly — previous day or earlier only
+  GET /flights/aircraft?icao24=X&begin=T1&end=T2
+    - flights for specific aircraft, max 2 day window
+    - used for watchlisted aircraft catch-up on restart
+    - expensive in credits — use sparingly
 
-  GET /flights/arrival
-  GET /flights/departure
-    - by airport ICAO code, max 2 day window
+Polling strategy — two tier adaptive:
+  Tier 1 discovery: global /states/all every 10-15 minutes
+    ~400 credits/day, finds new interesting aircraft
+  Tier 2 watchlist: higher frequency for flagged aircraft
+    specific ICAO24 queries, ~3,600 credits/day remaining
+    tightens on events: tanker airborne, unusual route,
+    aircraft disappears, aircraft reappears
+  Collector reads watchlist dynamically from PostgreSQL
+  and adjusts query parameters accordingly.
 
-Polling interval: every 10 seconds for /states/all
-Token refresh: proactively before 30 minute expiry
-On startup catch-up: query /states/all with time=now-3600
+Token refresh: proactively before 30 minute expiry (at 25 min)
+Kafka broker: from env var KAFKA_BOOTSTRAP_SERVERS,
+              default localhost:9092
 
 ## State Vector Field Indices
 OpenSky returns states as arrays — deserialise by index:
   0:  icao24          hex string, unique transponder address
-  1:  callsign        8 chars, nullable
+  1:  callsign        8 chars, nullable, trim whitespace
   2:  origin_country  inferred from icao24
   3:  time_position   unix timestamp last position, nullable
   4:  last_contact    unix timestamp last contact
   5:  longitude       WGS-84 decimal degrees, nullable
   6:  latitude        WGS-84 decimal degrees, nullable
   7:  baro_altitude   metres, nullable
-  8:  on_ground       boolean
+  8:  on_ground       boolean — unreliable, use as confirming
+                      signal only, not primary signal
   9:  velocity        m/s over ground, nullable
   10: true_track      degrees clockwise from north, nullable
   11: vertical_rate   m/s positive=climbing, nullable
-  12: sensors         receiver IDs, nullable
+  12: sensors         receiver IDs, nullable, skip
   13: geo_altitude    metres, nullable
   14: squawk          transponder code, nullable
   15: spi             special purpose indicator boolean
   16: position_source 0=ADS-B 1=ASTERIX 2=MLAT 3=FLARM
-  17: category        only present when extended=1
+  17: category        only present when extended=1,
+                      0=no information (very common)
 
-## Aircraft Categories (extended=1)
-  4: Large (75,000-300,000 lbs)
-  5: High Vortex Large (B-757 class)
-  6: Heavy (> 300,000 lbs) — primary interest
+## on_ground Unreliability
+on_ground = true is rare and unreliable in OpenSky data.
+Ground-level ADS-B reception is poor. Do not rely solely
+on on_ground flag for landing/takeoff detection.
+Use altitude + speed + position heuristics as primary signals:
+
+Landing detection:
+  vertical_rate strongly negative
+  + velocity decreasing toward ~250 km/h
+  + baro_altitude approaching known field elevation
+  + position near known airport (ST_Within)
+  + track aligned with runway centreline
+  → flight phase: ON_APPROACH → LANDED
+
+Takeoff detection:
+  velocity increasing
+  + vertical_rate strongly positive
+  + altitude increasing
+  + position near known airport
+
+## Flight Phase State Machine (per aircraft, Flink keyed state)
+UNKNOWN
+  → position received, on_ground=false → AIRBORNE
+  → position received, on_ground=true → ON_GROUND
+
+AIRBORNE
+  → position, on_ground=false → extend track
+  → descent profile + airport proximity → ON_APPROACH
+  → no message > threshold → LOST_TRACKING (do not close flight)
+
+ON_APPROACH
+  → on_ground=true OR disappears during approach → LANDED
+  → altitude increases again → AIRBORNE (go-around)
+
+LANDED / ON_GROUND
+  → velocity increases + climbing → new Flight, AIRBORNE
+  → if takeoff position ≠ landing airport → flag anomaly
+
+LOST_TRACKING
+  → reappears on_ground=false → gap segment, resume, AIRBORNE
+  → reappears on_ground=true → landed during gap, ON_GROUND
+
+## Flight and Track Data Model
+Flight:
+  flightId          icao24 + takeoff_timestamp (composite key)
+  icao24            permanent aircraft identifier
+  callsign          nullable, may change between flights
+  takeoffTime       Instant
+  takeoffAirport    enriched from PostGIS airports layer
+  landingTime       Instant, null if still airborne
+  landingAirport    enriched from PostGIS airports layer
+  status            AIRBORNE | LANDED | LOST_TRACKING
+  track             List<TrackPoint>
+  gaps              List<TrackSegment>
+
+TrackPoint:
+  timestamp         Instant
+  latitude          Double
+  longitude         Double
+  altitude          Double
+  velocity          Double
+  heading           Double
+  positionSource    Integer (0=ADS-B preferred)
+  interpolated      Boolean
+
+TrackSegment (coverage gap):
+  start             TrackPoint (last known before gap)
+  end               TrackPoint (first known after gap)
+  gapDuration       Duration
+  impliedSpeed      Double (ST_DistanceSphere / gapDuration)
+  physicallyPlausible Boolean (impliedSpeed < 1200 km/h)
+  landingPossible   Boolean (gapDuration > 2 hours)
+  landingProbability Double 0.0-1.0
+  type              OBSERVED | INTERPOLATED | UNCERTAIN
+
+Gap duration heuristics:
+  < 2 hours:   unlikely landed — coverage gap probable
+  2-6 hours:   ambiguous
+  > 6 hours:   landing probable
+  > 24 hours:  almost certainly landed somewhere
 
 ## Kafka Topics
-  adsb.states          JSON, raw from OpenSky
+  adsb.states          JSON, raw OpenSky snapshots
+                       one message per poll, key=snapshot timestamp
+                       30 day retention — critical for algo iteration
+                       without replaying historical data the project
+                       has no development value
+  adsb.tracks          JSON, per-aircraft position updates
+                       key=icao24, 7 day retention
+  adsb.flights         Protobuf, flight lifecycle events
+                       takeoff/landing/gap/anomaly
+                       key=flightId
   events.anomalies     Protobuf
   events.watchlist     Protobuf
   events.trade_flows   Protobuf
 
 ## Serialisation
-- adsb.states: JSON only — preserve raw OpenSky data
+- adsb.states: raw JSON string — never transcode or parse in collector
+- adsb.tracks: JSON per AircraftPosition
 - Internal event topics: Protobuf
 - Document state: PostgreSQL JSONB
 - Never transcode raw OpenSky data to Protobuf
 
 ## Key Identifiers
 ICAO24: permanent aircraft identifier, primary key throughout
+        hex string, always lowercase
 Callsign: changes per flight, not reliable as identifier
+          trim whitespace — OpenSky pads to 8 chars
 Registration: tail number, links to external registries
+FlightId: icao24 + takeoff_timestamp — unique per flight
 
-## adsb-analyser — Flink Processing
-- StreamExecutionEnvironment with SedonaFlink registered
-- Always use event time from OpenSky timestamps
-- Never use processing time
-- RocksDB state backend
-- Watermark lag: ~60 seconds
+## Aircraft Categories (extended=1)
+  0: No information (very common — most aircraft)
+  4: Large (75,000-300,000 lbs)
+  5: High Vortex Large (B-757 class)
+  6: Heavy (> 300,000 lbs)
+Category field unreliable for filtering — use ICAO24
+registry lookup for aircraft type identification instead.
 
-## Two-Tier State
-Hot (RocksDB):
-  TTL 48-72 hours no contact
-  Watchlisted aircraft: TTL suppressed
-  On TTL expiry: write snapshot to PostgreSQL
+## Aircraft Metadata Reference Table (PostgreSQL)
+Maps icao24 → type, registration, operator, manufacturer.
+Write-once, rarely-update (physical airframe never changes).
+Sources in order:
+  1. FAA registry CSV (free bulk download, daily updated)
+  2. OpenSky aircraft database CSV (free download)
+  3. planespotters.net API (free tier, gaps only,
+     cache result permanently — never re-query)
+Reload FAA + OpenSky CSVs weekly via script in reference-data/.
+Zero OpenSky credits consumed for enrichment.
 
-Cold (PostgreSQL JSONB):
-  Long-term history, rehydrate into RocksDB on reappearance
+## Aircraft Types of Interest
+Boeing 747F / 747-8F    large intercontinental cargo
+Boeing 777F             large, increasingly common
+Boeing 767F             medium, FedEx/UPS workhorse
+Airbus A330F            medium cargo
+Ilyushin IL-76          Soviet-era, common Africa/Middle East
+                        often associated with grey market ops
+Antonov AN-124          enormous, military/oversized cargo
+                        unusual routes always notable
+KC-135 / KC-46          US military tankers
+                        orbit patterns imply nearby operations
+C-17 Globemaster        US military transport
+A400M                   European military transport
 
-## PostgreSQL JSONB Collections
-  aircraft        per-aircraft state and history
-  watchlist       tracked aircraft + uncertainty state
-  trade_flows     inferred cargo movement events
-  anomaly_history scored events
+## Operators of Interest
+Integrators (baseline behaviour, not primary focus):
+  FedEx, UPS Airlines, DHL Aviation
+
+Charter/ad-hoc (anomaly targets):
+  Atlas Air, Silk Way Airlines, Air Bridge Cargo
+  Volga-Dnepr, smaller post-Soviet operators
+
+Military (tracking interest):
+  US Air Mobility Command (RCH*, REACH* callsigns)
+  NATO logistics aircraft
+
+## Sedona Operations Planned
+1. Airport proximity:
+   ST_Within(aircraft_position, airport_boundary)
+   + altitude check vs field elevation
+   → gap classification, landing detection
+
+2. Runway alignment (approach detection):
+   Bearing calculation vs runway centreline geometry
+   → ON_APPROACH state confirmation
+
+3. Gap implied speed:
+   ST_DistanceSphere(last_known, reappearance) / gap_duration
+   → physical plausibility check
+
+4. Tanker range cone:
+   ST_Buffer(last_known_position, max_range_km)
+   intersected with heading sector
+   → post-disappearance uncertainty cone
+
+5. Airport comparison:
+   ST_Distance(takeoff_airport, reappearance_position)
+   → same airport vs repositioning vs anomaly
+
+6. Route deviation (future):
+   ST_HausdorffDistance(observed_track, baseline_track)
+   → anomaly scoring
+
+7. Sensitive location proximity (future):
+   ST_Within(position, sensitive_area_polygon)
+   → flag cargo aircraft near military/sanctioned locations
 
 ## PostGIS Reference Layers
-  airports            point + polygon, ICAO codes
-  cargo_terminals     cargo ramp areas within airports
-  airspace_boundaries FIR boundaries, restricted zones
+  airports              point + polygon, ICAO codes,
+                        field elevation, type, runway geometries
+  cargo_terminals       specific cargo ramp areas
+  airspace_boundaries   FIR boundaries, restricted zones
+  sensitive_locations   military airfields, known grey-market hubs
+                        e.g. Sharjah (OMSJ) flagged
+
+## Airport Type for Anomaly Scoring
+  major international   expected for any operator
+  regional commercial   expected for smaller aircraft
+  military              unexpected for civilian — flag
+  private/GA            unexpected for large cargo — flag
+  known grey-market     flag regardless (Sharjah etc.)
+
+## Two-Tier State Management
+Hot tier (Flink RocksDB):
+  Active flights and recent track history
+  TTL 48-72 hours no contact
+  Watchlisted aircraft: TTL suppressed
+
+Cold tier (PostgreSQL JSONB):
+  Completed flights, long-term history
+  On landing or TTL expiry: write to PostgreSQL
+  On reappearance: check PostgreSQL for previous flight context
+
+## PostgreSQL JSONB Collections
+  aircraft        per-aircraft metadata and state
+  flights         completed flight records with full track
+  watchlist       tracked aircraft + cone state
+  trade_flows     inferred cargo movement events
+  anomaly_history scored events
 
 ## Spatial Operations
 - ST_DistanceSphere for distance calculations
 - Coordinates WGS-84 (EPSG:4326) throughout
-- OpenSky returns longitude first, then latitude
+- OpenSky returns longitude (index 5) then latitude (index 6)
   be explicit when constructing Sedona geometry points
-- Broadcast state pattern for airport/airspace lookups
+- Broadcast state for static airport/airspace lookups
+- Altitude always check alongside 2D spatial queries
+
+## Flink Job Structure (adsb-analyser)
+Single Flink job, multiple pipelines from one source:
+
+  KafkaSource(adsb.states)
+    → flatMap: explode snapshot → AircraftPosition
+    → keyBy(icao24)
+    → Pipeline 1: write to adsb.tracks
+    → Pipeline 2: FlightStateMachine (keyed process function)
+        maintains Flight state per aircraft in RocksDB
+        emits to adsb.flights on state transitions
+        emits to events.anomalies on anomaly detection
+    → Pipeline 3: (future) trade flow inference
 
 ## Anomaly Scoring
-- Fuzzy 0.0-1.0 confidence scores, not binary thresholds
-- Scores accumulate in per-aircraft Flink state
-- Alert only when score sustained above threshold over time
+Fuzzy 0.0-1.0 confidence scores throughout.
+No binary thresholds.
+Scores accumulate in per-aircraft Flink state.
+Alert only when score sustained above threshold over time window.
+
+## Catch-up on Restart
+On adsb-collector startup:
+  Query /states/all with time=now-3600 for 1hr recovery
+  For each watchlisted ICAO24: query /flights/aircraft
+  for past 48 hours to recover missed flights
 
 ## Design Decisions
-- Flink for stateful streaming and event-time correctness
-- Raw JSON preserved in Kafka
+- Flink not Spark — stateful per-aircraft processing,
+  even with 10-15 min polling rhythm
+- Raw JSON preserved in Kafka — never transcode
 - JSONB in PostgreSQL — no MongoDB
 - Independent Maven modules — no parent pom
-- Observational language throughout — never judgemental
-- Do not fetch external URLs autonomously
-- If documentation needed, ask user to provide the section
+- Observational language — never judgemental
+- on_ground unreliable — use heuristics
+- Category field unreliable — use ICAO24 registry lookup
+- 30 day Kafka retention — critical for development replay
 
-## Current State
-Planning complete. No code written yet.
-First task: exploratory adsb-collector — connect to OpenSky,
-poll /states/all, print raw responses to console, understand
-field population and nullability before wiring Kafka.
-
-## Kafka Retention
-30-day local retention on Redpanda. Deliberate architectural
-decision — enables replaying historical events through
-different algorithm versions during development, without
-waiting for live recurrence of interesting events
-(e.g. tanker disappearances, route anomalies).
-
-## Adaptive Polling Strategy
-adsb-collector polling is two-tier and dynamic, not fixed-interval:
-
-Tier 1 — Discovery sweep:
-  Global /states/all query every 10-15 minutes
-  Identifies candidate aircraft of interest
-  Adds candidates to watchlist
-
-Tier 2 — Watchlist tracking:
-  Higher frequency queries for flagged aircraft
-  Interval tightens dynamically on events:
-    - Tanker airborne → add to watchlist, increase frequency
-    - Unusual route detected → add to watchlist
-    - Aircraft disappears → maximum frequency on last known area
-    - Aircraft reappears → capture precisely, then relax frequency
-
-Collector reads watchlist from PostgreSQL or a dedicated Kafka
-topic and adjusts query parameters accordingly.
-
-Credit budget target:
-  ~400 credits/day for discovery sweep (global, every 10-15 min)
-  ~3,600 credits/day available for watchlist tracking
-
-## Aircraft Metadata Reference Table
-PostgreSQL table mapping icao24 → aircraft type, registration,
-operator, manufacturer. Write-once, rarely-update reference data
-(physical airframe attributes do not change).
-
-Sources, in order:
-  1. FAA registry CSV (free bulk download, daily updated)
-  2. OpenSky aircraft database CSV (free download)
-  3. planespotters.net API (free tier, for gaps only,
-     result cached permanently — never re-queried)
-
-Reload FAA + OpenSky CSVs periodically (weekly) via script
-in reference-data/. This enrichment consumes zero OpenSky
-API credits — credits reserved entirely for /states/all
-polling.
+## Current Development State
+adsb-collector: complete, polling every 10 minutes,
+                writing raw snapshots to adsb.states
+adsb-analyser:  pom.xml and explode job created,
+                not yet tested against live Kafka
+Next milestone: run explode job, verify adsb.tracks populated,
+                then implement FlightStateMachine
+                
