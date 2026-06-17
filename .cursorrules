@@ -176,6 +176,9 @@ Gap duration heuristics:
   > 24 hours:  almost certainly landed somewhere
 
 ## Kafka Topics
+  adsb.plane_state     Protobuf, current state per aircraft
+                       log compacted — latest value per ICAO24 key
+                       frontend subscribes to this topic
   adsb.states          JSON, raw OpenSky snapshots
                        one message per poll, key=snapshot timestamp
                        30 day retention — critical for algo iteration
@@ -197,6 +200,19 @@ Gap duration heuristics:
 - Document state: PostgreSQL JSONB
 - Never transcode raw OpenSky data to Protobuf
 
+
+## Protobuf Messages (adsb-analyser/src/main/proto/aircraft.proto)
+PlaneState:     current state per aircraft → adsb.plane_state
+PositionUpdate: enriched position with flight phase → adsb.tracks
+                (future — adsb.tracks currently JSON AircraftPosition)
+
+Enums:
+  FlightPhase: FLIGHT_PHASE_UNKNOWN, AIRBORNE, ON_APPROACH,
+               ON_GROUND, LOST_TRACKING
+  PositionSource: POSITION_SOURCE_UNKNOWN, ADS_B, MLAT, 
+                  ASTERIX, FLARM
+
+
 ## Key Identifiers
 ICAO24: permanent aircraft identifier, primary key throughout
         hex string, always lowercase
@@ -204,6 +220,13 @@ Callsign: changes per flight, not reliable as identifier
           trim whitespace — OpenSky pads to 8 chars
 Registration: tail number, links to external registries
 FlightId: icao24 + takeoff_timestamp — unique per flight
+
+
+## System-Generated Identifiers
+FlightId, journey_id, anomaly_score, flight_phase — all generated
+by our Flink pipeline. Not sourced from external data.
+FlightId = icao24 + takeoff_timestamp_ms
+
 
 ## Aircraft Categories (extended=1)
   0: No information (very common — most aircraft)
@@ -359,13 +382,22 @@ On adsb-collector startup:
 - 30 day Kafka retention — critical for development replay
 
 ## Current Development State
-adsb-collector: complete, polling every 10 minutes,
+adsb-collector: ✅ complete, polling every 10 minutes,
                 writing raw snapshots to adsb.states
-adsb-analyser:  pom.xml and explode job created,
+common:         ✅ AircraftPosition POJO
+adsb-analyser:  ✅ explode job, Protobuf schemas, compiles
                 not yet tested against live Kafka
-Next milestone: run explode job, verify adsb.tracks populated,
+Next milestone: run explode job end-to-end with Redpanda,
+                verify adsb.tracks populated,
                 then implement FlightStateMachine
-                
+
+## PostGIS Schema Style
+Hybrid approach: typed columns for core fields,
+JSONB properties column for flexible attributes.
+GIN index on properties for efficient JSONB queries.
+Special location attributes (mro, boneyard, grey_market_hub)
+stored in airports.properties JSONB column.
+
 
 Always use Plan mode unless explicitly instructed otherwise.
 Do not switch to Agent mode autonomously.
