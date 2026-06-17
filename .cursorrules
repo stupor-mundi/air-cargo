@@ -366,3 +366,6 @@ adsb-analyser:  pom.xml and explode job created,
 Next milestone: run explode job, verify adsb.tracks populated,
                 then implement FlightStateMachine
                 
+
+Always use Plan mode unless explicitly instructed otherwise.
+Do not switch to Agent mode autonomously.
