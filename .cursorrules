@@ -176,22 +176,11 @@ Gap duration heuristics:
   > 24 hours:  almost certainly landed somewhere
 
 ## Kafka Topics
+  adsb.states          JSON, raw OpenSky snapshots
+  adsb.tracks          Protobuf (PositionUpdate) — enriched, internal
   adsb.plane_state     Protobuf, current state per aircraft
                        log compacted — latest value per ICAO24 key
                        frontend subscribes to this topic
-  adsb.states          JSON, raw OpenSky snapshots
-                       one message per poll, key=snapshot timestamp
-                       30 day retention — critical for algo iteration
-                       without replaying historical data the project
-                       has no development value
-  adsb.tracks          JSON, per-aircraft position updates
-                       key=icao24, 7 day retention
-  adsb.flights         Protobuf, flight lifecycle events
-                       takeoff/landing/gap/anomaly
-                       key=flightId
-  events.anomalies     Protobuf
-  events.watchlist     Protobuf
-  events.trade_flows   Protobuf
 
 ## Serialisation
 - adsb.states: raw JSON string — never transcode or parse in collector
