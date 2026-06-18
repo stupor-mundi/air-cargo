@@ -2,6 +2,9 @@ package io.aircargo.analyser;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.aircargo.analyser.proto.PlaneState;
+import io.aircargo.analyser.proto.PositionUpdate;
+import io.aircargo.analyser.statemachine.FlightStateMachine;
 import io.aircargo.common.model.AircraftPosition;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
@@ -10,6 +13,8 @@ import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.util.Collector;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -23,9 +28,10 @@ public class AdsbAnalyserMain {
 
     private static final Logger log = LoggerFactory.getLogger(AdsbAnalyserMain.class);
 
-    private static final String TOPIC_IN  = "adsb.states";
-    private static final String TOPIC_OUT = "adsb.tracks";
-    private static final String GROUP_ID  = "adsb-analyser";
+    private static final String TOPIC_IN          = "adsb.states";
+    private static final String TOPIC_TRACKS      = "adsb.tracks";
+    private static final String TOPIC_PLANE_STATE = "adsb.plane_state";
+    private static final String GROUP_ID          = "adsb-analyser";
 
     public static void main(String[] args) throws Exception {
         String bootstrapServers = Optional.ofNullable(System.getenv("KAFKA_BOOTSTRAP_SERVERS"))
@@ -44,14 +50,26 @@ public class AdsbAnalyserMain {
                 .setValueOnlyDeserializer(new SimpleStringSchema())
                 .build();
 
-        KafkaSink<AircraftPosition> sink = KafkaSink.<AircraftPosition>builder()
-                .setBootstrapServers(bootstrapServers)
-                .setRecordSerializer(new AircraftPositionSerializer(TOPIC_OUT))
-                .build();
+        DataStream<AircraftPosition> positions = env
+                .fromSource(source, WatermarkStrategy.noWatermarks(), "adsb.states")
+                .flatMap(new SnapshotSplitter());
 
-        env.fromSource(source, WatermarkStrategy.noWatermarks(), "adsb.states")
-                .flatMap(new SnapshotSplitter())
-                .sinkTo(sink);
+        SingleOutputStreamOperator<PositionUpdate> mainStream = positions
+                .keyBy(AircraftPosition::getIcao24)
+                .process(new FlightStateMachine());
+
+        DataStream<PlaneState> planeStateStream =
+                mainStream.getSideOutput(FlightStateMachine.PLANE_STATE_TAG);
+
+        mainStream.sinkTo(KafkaSink.<PositionUpdate>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(new PositionUpdateSerializer(TOPIC_TRACKS))
+                .build());
+
+        planeStateStream.sinkTo(KafkaSink.<PlaneState>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(new PlaneStateSerializer(TOPIC_PLANE_STATE))
+                .build());
 
         env.execute("adsb-analyser");
     }
@@ -166,35 +184,46 @@ public class AdsbAnalyserMain {
     }
 
     // ---------------------------------------------------------------------------
-    // KafkaRecordSerializationSchema: icao24 → key, JSON → value
+    // Kafka serialisers — Protobuf bytes
     // ---------------------------------------------------------------------------
 
-    static class AircraftPositionSerializer implements KafkaRecordSerializationSchema<AircraftPosition> {
+    static class PositionUpdateSerializer
+            implements KafkaRecordSerializationSchema<PositionUpdate> {
 
         private final String topic;
-        private transient ObjectMapper mapper;
 
-        AircraftPositionSerializer(String topic) {
+        PositionUpdateSerializer(String topic) {
             this.topic = topic;
         }
 
         @Override
         public ProducerRecord<byte[], byte[]> serialize(
-                AircraftPosition element,
+                PositionUpdate element,
                 KafkaSinkContext context,
                 Long timestamp) {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
-            try {
-                byte[] key   = element.getIcao24().getBytes(StandardCharsets.UTF_8);
-                byte[] value = mapper.writeValueAsBytes(element);
-                return new ProducerRecord<>(topic, key, value);
-            } catch (Exception e) {
-                log.error("Failed to serialise AircraftPosition icao24={}: {}",
-                        element.getIcao24(), e.getMessage(), e);
-                return null;
-            }
+            byte[] key   = element.getIcao24().getBytes(StandardCharsets.UTF_8);
+            byte[] value = element.toByteArray();
+            return new ProducerRecord<>(topic, key, value);
+        }
+    }
+
+    static class PlaneStateSerializer
+            implements KafkaRecordSerializationSchema<PlaneState> {
+
+        private final String topic;
+
+        PlaneStateSerializer(String topic) {
+            this.topic = topic;
+        }
+
+        @Override
+        public ProducerRecord<byte[], byte[]> serialize(
+                PlaneState element,
+                KafkaSinkContext context,
+                Long timestamp) {
+            byte[] key   = element.getIcao24().getBytes(StandardCharsets.UTF_8);
+            byte[] value = element.toByteArray();
+            return new ProducerRecord<>(topic, key, value);
         }
     }
 }

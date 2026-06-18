@@ -2,6 +2,7 @@ package io.aircargo.analyser.statemachine;
 
 import io.aircargo.analyser.proto.FlightPhase;
 import io.aircargo.analyser.proto.PlaneState;
+import io.aircargo.analyser.proto.PositionUpdate;
 import io.aircargo.common.model.AircraftPosition;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.operators.KeyedProcessOperator;
@@ -20,15 +21,17 @@ import static org.junit.jupiter.api.Assertions.*;
  * Unit tests for {@link FlightStateMachine} using Flink's
  * {@link KeyedOneInputStreamOperatorTestHarness}.
  *
- * <p>Each test creates its own harness so state is isolated.
- * Processing time is controlled via {@code harness.setProcessingTime()}
- * to trigger lost-tracking timers deterministically.
+ * <p>Main output: {@link PositionUpdate} — accessed via {@link #allOutputs()} / {@link #lastOutput()}.
+ * Side output: {@link PlaneState} — accessed via {@link #allSideOutputs()}.
+ *
+ * <p>Processing time is controlled via {@code harness.setProcessingTime()} to
+ * trigger lost-tracking timers deterministically.
  */
 class FlightStateMachineTest {
 
     private static final String ICAO24 = "abc123";
 
-    private KeyedOneInputStreamOperatorTestHarness<String, AircraftPosition, PlaneState> harness;
+    private KeyedOneInputStreamOperatorTestHarness<String, AircraftPosition, PositionUpdate> harness;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -56,39 +59,37 @@ class FlightStateMachineTest {
      */
     @Test
     void test_unknownToAirborne() throws Exception {
-        AircraftPosition pos = buildPos(ICAO24, false, 150.0, 5000.0, 0.0, 1000L);
-        harness.processElement(pos, 1000L);
+        harness.processElement(buildPos(ICAO24, false, 150.0, 5000.0, 0.0, 1000L), 1000L);
 
-        PlaneState last = lastOutput();
-        assertNotNull(last, "Expected at least one PlaneState output");
+        PositionUpdate last = lastOutput();
+        assertNotNull(last, "Expected at least one PositionUpdate output");
         assertEquals(FlightPhase.AIRBORNE, last.getFlightPhase());
-        assertFalse(last.getCurrentFlightId().isBlank(), "flightId should be set");
+        assertFalse(last.getFlightId().isBlank(), "flightId should be set");
     }
 
     /**
      * Full flight cycle: UNKNOWN → AIRBORNE (cruise) → ON_APPROACH (descending
      * and slowing below 3000m) → ON_GROUND (landed).
-     * After landing, flightId should be cleared.
+     * After landing, flightId on PlaneState side output should be blank.
      */
     @Test
     void test_simpleFlightCycle() throws Exception {
-        // Cruise: transitions UNKNOWN → AIRBORNE
         harness.processElement(buildPos(ICAO24, false, 220.0, 10000.0, 2.0, 1000L), 1000L);
-        // Approach: verticalRate=-6, velocity=90, altitude=2000 → AIRBORNE → ON_APPROACH
         harness.processElement(buildPos(ICAO24, false, 90.0, 2000.0, -6.0, 2000L), 2000L);
-        // Landed: onGround=true → ON_APPROACH → ON_GROUND
         harness.processElement(buildPos(ICAO24, true, 5.0, 30.0, -1.0, 3000L), 3000L);
 
-        List<PlaneState> outputs = allOutputs();
-        assertEquals(3, outputs.size(), "Expected one output per position");
+        List<PositionUpdate> outputs = allOutputs();
+        assertEquals(3, outputs.size(), "Expected one PositionUpdate per position");
 
-        assertEquals(FlightPhase.AIRBORNE,     outputs.get(0).getFlightPhase());
-        assertEquals(FlightPhase.ON_APPROACH,  outputs.get(1).getFlightPhase());
-        assertEquals(FlightPhase.ON_GROUND,    outputs.get(2).getFlightPhase());
+        assertEquals(FlightPhase.AIRBORNE,    outputs.get(0).getFlightPhase());
+        assertEquals(FlightPhase.ON_APPROACH, outputs.get(1).getFlightPhase());
+        assertEquals(FlightPhase.ON_GROUND,   outputs.get(2).getFlightPhase());
 
-        // flightId cleared after reset() on landing
-        assertTrue(outputs.get(2).getCurrentFlightId().isBlank(),
-                "flightId should be blank after landing");
+        // flightId cleared after reset() on landing — check PlaneState side output
+        List<PlaneState> sideOutputs = allSideOutputs();
+        assertEquals(3, sideOutputs.size(), "Expected one PlaneState per position");
+        assertTrue(sideOutputs.get(2).getCurrentFlightId().isBlank(),
+                "PlaneState flightId should be blank after landing");
     }
 
     /**
@@ -97,14 +98,11 @@ class FlightStateMachineTest {
      */
     @Test
     void test_goAround() throws Exception {
-        // Cruise → AIRBORNE
         harness.processElement(buildPos(ICAO24, false, 220.0, 10000.0, 2.0, 1000L), 1000L);
-        // Approach → ON_APPROACH
         harness.processElement(buildPos(ICAO24, false, 90.0, 2000.0, -5.0, 2000L), 2000L);
-        // Go-around: altitude increases, verticalRate > 1 → back to AIRBORNE
         harness.processElement(buildPos(ICAO24, false, 120.0, 2200.0, 4.0, 3000L), 3000L);
 
-        List<PlaneState> outputs = allOutputs();
+        List<PositionUpdate> outputs = allOutputs();
         assertEquals(3, outputs.size());
         assertEquals(FlightPhase.AIRBORNE,    outputs.get(0).getFlightPhase());
         assertEquals(FlightPhase.ON_APPROACH, outputs.get(1).getFlightPhase());
@@ -115,35 +113,39 @@ class FlightStateMachineTest {
     /**
      * Aircraft goes LOST_TRACKING (timer fires after 25 minutes of no contact),
      * then reappears still airborne and resumes with the same flightId.
+     *
+     * <p>LOST_TRACKING appears on the PlaneState side output (emitted from the timer).
+     * The resumed AIRBORNE phase appears on the main PositionUpdate output.
      */
     @Test
     void test_lostTrackingReappears() throws Exception {
         // Position 1: airborne at processing time 0, snapshotTimeMs=0
-        AircraftPosition p1 = buildPos(ICAO24, false, 200.0, 9000.0, 1.0, 0L);
-        harness.processElement(p1, 0L);
+        harness.processElement(buildPos(ICAO24, false, 200.0, 9000.0, 1.0, 0L), 0L);
 
-        String originalFlightId = lastOutput().getCurrentFlightId();
+        String originalFlightId = lastOutput().getFlightId();
         assertFalse(originalFlightId.isBlank(), "flightId should be set before gap");
 
-        // Advance processing time past the 25-minute timer threshold
-        // Timer was registered at 0 + 25*60*1000 = 1_500_000ms
+        // Advance processing time past the 25-minute timer threshold.
+        // Timer registered at currentProcessingTime(0) + 25*60*1000 = 1_500_000ms.
         harness.setProcessingTime(26L * 60L * 1000L);
 
-        // Timer fires: lastSeenMs=0, ageMs = 1_500_000 > 20min threshold → LOST_TRACKING
-        List<PlaneState> afterTimer = allOutputs();
-        PlaneState lostState = afterTimer.get(afterTimer.size() - 1);
-        assertEquals(FlightPhase.LOST_TRACKING, lostState.getFlightPhase(),
-                "Should enter LOST_TRACKING after timer fires");
+        // Timer fires → LOST_TRACKING emitted on PlaneState side output only.
+        // Main output count is still 1 (no PositionUpdate from timer).
+        assertEquals(1, allOutputs().size(), "Timer should not add to main output");
+        List<PlaneState> sideAfterTimer = allSideOutputs();
+        assertEquals(FlightPhase.LOST_TRACKING,
+                sideAfterTimer.get(sideAfterTimer.size() - 1).getFlightPhase(),
+                "PlaneState side output should show LOST_TRACKING after timer fires");
 
         // Reappearance: airborne, 60 minutes after start
-        AircraftPosition reappearance = buildPos(ICAO24, false, 180.0, 8500.0, 0.5,
+        harness.processElement(
+                buildPos(ICAO24, false, 180.0, 8500.0, 0.5, 60L * 60L * 1000L),
                 60L * 60L * 1000L);
-        harness.processElement(reappearance, 60L * 60L * 1000L);
 
-        PlaneState resumed = lastOutput();
+        PositionUpdate resumed = lastOutput();
         assertEquals(FlightPhase.AIRBORNE, resumed.getFlightPhase(),
                 "Should resume AIRBORNE on reappearance");
-        assertEquals(originalFlightId, resumed.getCurrentFlightId(),
+        assertEquals(originalFlightId, resumed.getFlightId(),
                 "Should resume with the same flightId");
     }
 
@@ -153,14 +155,13 @@ class FlightStateMachineTest {
      */
     @Test
     void test_firstSeenAirborne() throws Exception {
-        AircraftPosition pos = buildPos(ICAO24, false, 240.0, 11000.0, 1.5, 5000L);
-        harness.processElement(pos, 5000L);
+        harness.processElement(buildPos(ICAO24, false, 240.0, 11000.0, 1.5, 5000L), 5000L);
 
-        PlaneState output = lastOutput();
+        PositionUpdate output = lastOutput();
         assertNotNull(output);
         assertEquals(FlightPhase.AIRBORNE, output.getFlightPhase(),
                 "First-ever sighting while airborne should produce AIRBORNE phase");
-        assertFalse(output.getCurrentFlightId().isBlank(),
+        assertFalse(output.getFlightId().isBlank(),
                 "flightId should be generated on first sighting");
     }
 
@@ -171,13 +172,6 @@ class FlightStateMachineTest {
     /**
      * Builds an {@link AircraftPosition} with the given key fields and
      * fixed defaults for lat/lon/heading so tests don't have to specify them.
-     *
-     * @param icao24       aircraft identifier
-     * @param onGround     {@code false} = airborne, {@code true} = on ground, {@code null} = unknown
-     * @param velocityMs   ground speed in m/s
-     * @param altitudeM    barometric altitude in metres
-     * @param verticalRate vertical rate in m/s (positive = climbing)
-     * @param snapshotMs   snapshot timestamp in milliseconds
      */
     private AircraftPosition buildPos(String icao24,
                                       Boolean onGround,
@@ -199,18 +193,26 @@ class FlightStateMachineTest {
     }
 
     @SuppressWarnings("unchecked")
-    private List<PlaneState> allOutputs() {
-        List<PlaneState> result = new ArrayList<>();
+    private List<PositionUpdate> allOutputs() {
+        List<PositionUpdate> result = new ArrayList<>();
         for (Object o : harness.getOutput()) {
             if (o instanceof StreamRecord) {
-                result.add((PlaneState) ((StreamRecord<?>) o).getValue());
+                result.add((PositionUpdate) ((StreamRecord<?>) o).getValue());
             }
         }
         return result;
     }
 
-    private PlaneState lastOutput() {
-        List<PlaneState> all = allOutputs();
+    private PositionUpdate lastOutput() {
+        List<PositionUpdate> all = allOutputs();
         return all.isEmpty() ? null : all.get(all.size() - 1);
+    }
+
+    private List<PlaneState> allSideOutputs() {
+        List<PlaneState> result = new ArrayList<>();
+        for (StreamRecord<PlaneState> r : harness.getSideOutput(FlightStateMachine.PLANE_STATE_TAG)) {
+            result.add(r.getValue());
+        }
+        return result;
     }
 }

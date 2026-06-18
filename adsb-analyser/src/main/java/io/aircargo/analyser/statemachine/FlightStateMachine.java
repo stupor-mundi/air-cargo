@@ -2,12 +2,15 @@ package io.aircargo.analyser.statemachine;
 
 import io.aircargo.analyser.proto.FlightPhase;
 import io.aircargo.analyser.proto.PlaneState;
+import io.aircargo.analyser.proto.PositionSource;
+import io.aircargo.analyser.proto.PositionUpdate;
 import io.aircargo.common.model.AircraftPosition;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,23 +21,32 @@ import org.slf4j.LoggerFactory;
  * <p>Keyed by ICAO24 (String). One {@link FlightState} is held in RocksDB
  * ValueState per aircraft.
  *
+ * <p><strong>Main output</strong> — {@link PositionUpdate} Protobuf message emitted
+ * on every position received, enriched with current flight phase and flight ID.
+ * Written to Kafka topic {@code adsb.tracks}.
+ *
+ * <p><strong>Side output</strong> — {@link PlaneState} Protobuf message emitted on
+ * every position AND on every state transition (including timer-driven
+ * LOST_TRACKING detection). Written to Kafka topic {@code adsb.plane_state}.
+ * Access via {@link #PLANE_STATE_TAG}.
+ *
  * <p>Processing-time timers are used (not event time) because OpenSky polling
  * gaps mean event-time watermarks advance slowly and would delay LOST_TRACKING
  * detection. A 25-minute timer is registered on every element; {@link #onTimer}
  * transitions to LOST_TRACKING only when the aircraft has not been seen for
  * &gt;20 minutes, making duplicate timer firings harmless.
  *
- * <p>Emits a {@link PlaneState} Protobuf message after every state transition
- * and every position update. Downstream, {@code PlaneState.toByteArray()} is
- * used to serialise to the {@code adsb.plane_state} Kafka topic.
- *
  * <p>{@code aircraft_type} and {@code operator} are left empty pending registry
  * lookup integration.
  */
 public class FlightStateMachine
-        extends KeyedProcessFunction<String, AircraftPosition, PlaneState> {
+        extends KeyedProcessFunction<String, AircraftPosition, PositionUpdate> {
 
     private static final Logger log = LoggerFactory.getLogger(FlightStateMachine.class);
+
+    /** Side output tag for {@link PlaneState} messages → {@code adsb.plane_state}. */
+    public static final OutputTag<PlaneState> PLANE_STATE_TAG =
+            new OutputTag<PlaneState>("plane-state") {};
 
     private static final long LOST_TRACKING_TIMER_MS      = 25 * 60 * 1000L;
     private static final long LOST_TRACKING_AGE_THRESHOLD = 20 * 60 * 1000L;
@@ -56,7 +68,7 @@ public class FlightStateMachine
     // ------------------------------------------------------------------
 
     @Override
-    public void processElement(AircraftPosition pos, Context ctx, Collector<PlaneState> out)
+    public void processElement(AircraftPosition pos, Context ctx, Collector<PositionUpdate> out)
             throws Exception {
 
         String icao24 = ctx.getCurrentKey();
@@ -139,7 +151,11 @@ public class FlightStateMachine
                 ctx.timerService().currentProcessingTime() + LOST_TRACKING_TIMER_MS);
 
         flightStateHandle.update(state);
-        out.collect(buildPlaneState(icao24, pos, state));
+
+        // Main output: PositionUpdate on every position
+        out.collect(buildPositionUpdate(icao24, pos, state));
+        // Side output: PlaneState on every position (keeps adsb.plane_state current)
+        ctx.output(PLANE_STATE_TAG, buildPlaneState(icao24, pos, state));
     }
 
     // ------------------------------------------------------------------
@@ -147,7 +163,7 @@ public class FlightStateMachine
     // ------------------------------------------------------------------
 
     @Override
-    public void onTimer(long timestamp, OnTimerContext ctx, Collector<PlaneState> out)
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<PositionUpdate> out)
             throws Exception {
 
         FlightState state = flightStateHandle.value();
@@ -167,7 +183,8 @@ public class FlightStateMachine
                 state.setPhase(FlightPhase.LOST_TRACKING);
                 state.setLostTrackingMs(timestamp);
                 flightStateHandle.update(state);
-                out.collect(buildPlaneState(ctx.getCurrentKey(), null, state));
+                // Side output only — no live position available for PositionUpdate
+                ctx.output(PLANE_STATE_TAG, buildPlaneState(ctx.getCurrentKey(), null, state));
             }
         }
     }
@@ -228,13 +245,42 @@ public class FlightStateMachine
     }
 
     // ------------------------------------------------------------------
-    // Output builder
+    // Output builders
     // ------------------------------------------------------------------
+
+    /**
+     * Builds a {@link PositionUpdate} from the current position and flight state.
+     * Emitted to the main output on every {@link #processElement} call.
+     */
+    private PositionUpdate buildPositionUpdate(String icao24, AircraftPosition pos,
+                                               FlightState state) {
+        PositionUpdate.Builder builder = PositionUpdate.newBuilder()
+                .setIcao24(icao24)
+                .setFlightPhase(state.getPhase() != null
+                        ? state.getPhase()
+                        : FlightPhase.FLIGHT_PHASE_UNKNOWN)
+                .setInterpolated(false)
+                .setAnomalyScore(state.getAnomalyScore())
+                .setPositionSource(mapPositionSource(pos.getPositionSource()));
+
+        if (state.getFlightId() != null)         builder.setFlightId(state.getFlightId());
+        if (pos.getSnapshotTimeMs() != null)     builder.setTimestampMs(pos.getSnapshotTimeMs());
+        if (pos.getLatitude() != null)           builder.setLatitude(pos.getLatitude());
+        if (pos.getLongitude() != null)          builder.setLongitude(pos.getLongitude());
+        if (pos.getBaroAltitudeM() != null)      builder.setAltitudeM(pos.getBaroAltitudeM());
+        if (pos.getGeoAltitudeM() != null)       builder.setGeoAltitudeM(pos.getGeoAltitudeM());
+        if (pos.getVelocityMs() != null)         builder.setVelocityMs(pos.getVelocityMs());
+        if (pos.getHeadingDeg() != null)         builder.setHeadingDeg(pos.getHeadingDeg());
+        if (pos.getVerticalRateMs() != null)     builder.setVerticalRateMs(pos.getVerticalRateMs());
+
+        return builder.build();
+    }
 
     /**
      * Builds a {@link PlaneState} from current state and an optional position.
      * When {@code pos} is null (e.g. called from {@link #onTimer}), last-known
      * values from {@code state} are used for position fields.
+     * Emitted to {@link #PLANE_STATE_TAG} side output.
      */
     private PlaneState buildPlaneState(String icao24, AircraftPosition pos, FlightState state) {
         PlaneState.Builder builder = PlaneState.newBuilder()
@@ -259,7 +305,7 @@ public class FlightStateMachine
             if (pos.getVelocityMs() != null)     builder.setVelocityMs(pos.getVelocityMs());
             if (pos.getHeadingDeg() != null)     builder.setHeadingDeg(pos.getHeadingDeg());
         } else {
-            // Use last-known state fields
+            // Use last-known state fields (called from onTimer, no live position)
             if (state.getLastSeenMs() != null)    builder.setTimestampMs(state.getLastSeenMs());
             if (state.getLastLat() != null)        builder.setLatitude(state.getLastLat());
             if (state.getLastLon() != null)        builder.setLongitude(state.getLastLon());
@@ -271,6 +317,23 @@ public class FlightStateMachine
         // aircraft_type and operator left empty — registry lookup deferred
 
         return builder.build();
+    }
+
+    /**
+     * Maps the OpenSky position_source integer (index 16) to the {@link PositionSource}
+     * proto enum. OpenSky values differ from proto enum values, requiring explicit mapping.
+     *
+     * <p>OpenSky: 0=ADS-B, 1=ASTERIX, 2=MLAT, 3=FLARM.
+     */
+    private static PositionSource mapPositionSource(Integer openSkySource) {
+        if (openSkySource == null) return PositionSource.POSITION_SOURCE_UNKNOWN;
+        switch (openSkySource) {
+            case 0:  return PositionSource.ADS_B;
+            case 1:  return PositionSource.ASTERIX;
+            case 2:  return PositionSource.MLAT;
+            case 3:  return PositionSource.FLARM;
+            default: return PositionSource.POSITION_SOURCE_UNKNOWN;
+        }
     }
 
     // ------------------------------------------------------------------
