@@ -29,7 +29,7 @@ message PositionUpdate {
   int64          timestamp_ms    = 3;  // from OpenSky snapshot time field
   double         latitude        = 4;
   double         longitude       = 5;
-  double         altitude_m      = 6;
+  double         altitude_m      = 6;  // is baro — used for flight phase detection
   double         velocity_ms     = 7;
   double         heading_deg     = 8;
   double         vertical_rate_ms = 9;
@@ -37,6 +37,7 @@ message PositionUpdate {
   FlightPhase    flight_phase    = 11;
   bool           interpolated    = 12; // true if inferred across coverage gap
   double         anomaly_score   = 13; // 0.0-1.0, running score from Flink state
+  double         geo_altitude_m  = 14; // GPS-derived, nullable — preferred for spatial ops
 }
 
 // Current state per aircraft.
