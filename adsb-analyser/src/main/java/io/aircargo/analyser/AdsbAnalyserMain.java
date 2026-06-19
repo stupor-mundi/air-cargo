@@ -32,7 +32,7 @@ public class AdsbAnalyserMain {
     private static final String TOPIC_IN          = "adsb.states";
     private static final String TOPIC_TRACKS      = "adsb.tracks";
     private static final String TOPIC_PLANE_STATE = "adsb.plane_state";
-    private static final String GROUP_ID          = "adsb-analyser-v2";
+    private static final String GROUP_ID          = "adsb-analyser-v3";
 
     public static void main(String[] args) throws Exception {
         String bootstrapServers = Optional.ofNullable(System.getenv("KAFKA_BOOTSTRAP_SERVERS"))
@@ -66,9 +66,9 @@ public class AdsbAnalyserMain {
                 new MapFunction<PositionUpdate, PositionUpdate>() {
                     @Override
                     public PositionUpdate map(PositionUpdate pu) {
-                        log.info("TRACK {} | flight={} | phase={} | alt={}m | spd={}m/s | ts={}",
+                        log.info("TRACK {} | flight={} | phase={} | lat={} | lon={} | alt={}m | spd={}m/s",
                                 pu.getIcao24(), pu.getFlightId(), pu.getFlightPhase().name(),
-                                pu.getAltitudeM(), pu.getVelocityMs(), pu.getTimestampMs());
+                                pu.getLatitude(), pu.getLongitude(), pu.getAltitudeM(), pu.getVelocityMs());
                         return pu;
                     }
                 });
@@ -77,9 +77,10 @@ public class AdsbAnalyserMain {
                 new MapFunction<PlaneState, PlaneState>() {
                     @Override
                     public PlaneState map(PlaneState ps) {
-                        log.info("STATE {} | phase={} | alt={}m | spd={}m/s | dep={} | score={}",
+                        log.info("STATE {} | phase={} | lat={} | lon={} | alt={}m | spd={}m/s | dep={} | score={}",
                                 ps.getIcao24(), ps.getFlightPhase().name(),
-                                ps.getAltitudeM(), ps.getVelocityMs(), ps.getDepartedFrom(), ps.getAnomalyScore());
+                                ps.getLatitude(), ps.getLongitude(), ps.getAltitudeM(), ps.getVelocityMs(),
+                                ps.getDepartedFrom(), ps.getAnomalyScore());
                         return ps;
                     }
                 });
