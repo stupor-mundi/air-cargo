@@ -8,6 +8,7 @@ import io.aircargo.analyser.statemachine.FlightStateMachine;
 import io.aircargo.common.model.AircraftPosition;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -31,7 +32,7 @@ public class AdsbAnalyserMain {
     private static final String TOPIC_IN          = "adsb.states";
     private static final String TOPIC_TRACKS      = "adsb.tracks";
     private static final String TOPIC_PLANE_STATE = "adsb.plane_state";
-    private static final String GROUP_ID          = "adsb-analyser";
+    private static final String GROUP_ID          = "adsb-analyser-v2";
 
     public static void main(String[] args) throws Exception {
         String bootstrapServers = Optional.ofNullable(System.getenv("KAFKA_BOOTSTRAP_SERVERS"))
@@ -61,12 +62,34 @@ public class AdsbAnalyserMain {
         DataStream<PlaneState> planeStateStream =
                 mainStream.getSideOutput(FlightStateMachine.PLANE_STATE_TAG);
 
-        mainStream.sinkTo(KafkaSink.<PositionUpdate>builder()
+        DataStream<PositionUpdate> tracksLogged = mainStream.map(
+                new MapFunction<PositionUpdate, PositionUpdate>() {
+                    @Override
+                    public PositionUpdate map(PositionUpdate pu) {
+                        log.info("TRACK {} | flight={} | phase={} | alt={}m | spd={}m/s | ts={}",
+                                pu.getIcao24(), pu.getFlightId(), pu.getFlightPhase().name(),
+                                pu.getAltitudeM(), pu.getVelocityMs(), pu.getTimestampMs());
+                        return pu;
+                    }
+                });
+
+        DataStream<PlaneState> statesLogged = planeStateStream.map(
+                new MapFunction<PlaneState, PlaneState>() {
+                    @Override
+                    public PlaneState map(PlaneState ps) {
+                        log.info("STATE {} | phase={} | alt={}m | spd={}m/s | dep={} | score={}",
+                                ps.getIcao24(), ps.getFlightPhase().name(),
+                                ps.getAltitudeM(), ps.getVelocityMs(), ps.getDepartedFrom(), ps.getAnomalyScore());
+                        return ps;
+                    }
+                });
+
+        tracksLogged.sinkTo(KafkaSink.<PositionUpdate>builder()
                 .setBootstrapServers(bootstrapServers)
                 .setRecordSerializer(new PositionUpdateSerializer(TOPIC_TRACKS))
                 .build());
 
-        planeStateStream.sinkTo(KafkaSink.<PlaneState>builder()
+        statesLogged.sinkTo(KafkaSink.<PlaneState>builder()
                 .setBootstrapServers(bootstrapServers)
                 .setRecordSerializer(new PlaneStateSerializer(TOPIC_PLANE_STATE))
                 .build());
