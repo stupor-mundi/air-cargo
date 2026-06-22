@@ -8,6 +8,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.slf4j.Logger;
@@ -55,13 +56,29 @@ public class PlaneStateExporter {
     }
 
     private static List<PlaneState> pollAll(KafkaConsumer<String, byte[]> consumer) throws Exception {
-        consumer.subscribe(List.of(TOPIC));
+        // Get partitions explicitly and seek to beginning
+        List<org.apache.kafka.common.TopicPartition> partitions = consumer
+                .partitionsFor(TOPIC)
+                .stream()
+                .map(p -> new org.apache.kafka.common.TopicPartition(TOPIC, p.partition()))
+                .toList();
+
+        consumer.assign(partitions);
+        consumer.seekToBeginning(partitions);
+
+        // confirm positions
+        for (TopicPartition p : partitions) {
+            log.info("Partition {} starting at offset {}", p.partition(), consumer.position(p));
+        }
+
+
         List<PlaneState> states = new ArrayList<>();
         int readCount = 0;
 
         log.info("Reading from topic {} (will stop after 3s with no new messages)", TOPIC);
         while (true) {
             ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofSeconds(3));
+            log.info("Poll returned {} records", records.count());
             if (records.isEmpty()) {
                 break;
             }
