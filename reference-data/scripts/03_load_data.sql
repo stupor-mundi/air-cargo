@@ -1,16 +1,14 @@
--- Run from the scripts/ directory:
---   psql -d <database> -f 03_load_data.sql
--- airports.csv and runways.csv must be present in the same directory.
-
+SET search_path = reference, public;
 
 -- ============================================================
 -- Section 1: Load airports (filtered to large/medium/small)
 -- ============================================================
 
 CREATE TEMP TABLE airports_raw (
+    id                INTEGER,
     ident             TEXT,
-    name              TEXT,
     type              TEXT,
+    name              TEXT,
     latitude_deg      DOUBLE PRECISION,
     longitude_deg     DOUBLE PRECISION,
     elevation_ft      INTEGER,
@@ -19,15 +17,16 @@ CREATE TEMP TABLE airports_raw (
     iso_region        TEXT,
     municipality      TEXT,
     scheduled_service TEXT,
-    gps_code          TEXT,
+    icao_code         TEXT,
     iata_code         TEXT,
+    gps_code          TEXT,
     local_code        TEXT,
     home_link         TEXT,
     wikipedia_link    TEXT,
     keywords          TEXT
 );
 
-\copy airports_raw FROM 'airports.csv' WITH (FORMAT csv, HEADER true);
+COPY airports_raw FROM '/tmp/airports.csv' WITH (FORMAT csv, HEADER true);
 
 INSERT INTO airports (
     ident,
@@ -101,7 +100,7 @@ CREATE TEMP TABLE runways_raw (
     he_displaced_threshold_ft INTEGER
 );
 
-\copy runways_raw FROM 'runways.csv' WITH (FORMAT csv, HEADER true);
+COPY runways_raw FROM '/tmp/runways.csv' WITH (FORMAT csv, HEADER true);
 
 INSERT INTO runways (
     id,

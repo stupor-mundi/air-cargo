@@ -1,3 +1,5 @@
+SET search_path = reference, public;
+
 CREATE TABLE IF NOT EXISTS runways (
     id                        INTEGER PRIMARY KEY,
     airport_ident             TEXT NOT NULL REFERENCES airports(ident),

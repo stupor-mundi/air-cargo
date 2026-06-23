@@ -1,3 +1,5 @@
+SET search_path = reference, public;
+
 CREATE TABLE IF NOT EXISTS airports (
     ident             TEXT PRIMARY KEY,
     name              TEXT NOT NULL,
@@ -13,10 +15,9 @@ CREATE TABLE IF NOT EXISTS airports (
     iata_code         TEXT,
     gps_code          TEXT,
     wikipedia_link    TEXT,
-    properties        JSONB
+    properties        JSONB,
+    geom              geometry(Point, 4326)
 );
-
-SELECT AddGeometryColumn('airports', 'geom', 4326, 'POINT', 2);
 
 CREATE INDEX IF NOT EXISTS airports_geom_idx
     ON airports USING GIST (geom);
