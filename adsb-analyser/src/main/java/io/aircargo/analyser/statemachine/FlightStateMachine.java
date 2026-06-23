@@ -52,6 +52,7 @@ public class FlightStateMachine
     private static final long LOST_TRACKING_AGE_THRESHOLD = 20 * 60 * 1000L;
 
     private ValueState<FlightState> flightStateHandle;
+    private AirportLookup airportLookup;
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -61,6 +62,15 @@ public class FlightStateMachine
     public void open(OpenContext openContext) throws Exception {
         flightStateHandle = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("flight-state", FlightState.class));
+        airportLookup = new AirportLookup();
+        airportLookup.open();
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (airportLookup != null) {
+            airportLookup.close();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -98,6 +108,7 @@ public class FlightStateMachine
                 state.setTakeoffLat(pos.getLatitude());
                 state.setTakeoffLon(pos.getLongitude());
                 log.info("New flight detected icao24={} flightId={}", icao24, flightId);
+                state.setDepartedFrom(lookupAirportSafe(icao24, pos.getLatitude(), pos.getLongitude()));
 
             } else if (Boolean.TRUE.equals(pos.getOnGround())) {
                 state.setPhase(FlightPhase.ON_GROUND);
@@ -122,7 +133,8 @@ public class FlightStateMachine
             } else if (Boolean.TRUE.equals(pos.getOnGround())
                     || (pos.getVelocityMs() != null && pos.getVelocityMs() < 10
                         && pos.getBaroAltitudeM() != null && pos.getBaroAltitudeM() < 100)) {
-                log.info("Landing detected icao24={} flightId={}", icao24, state.getFlightId());
+                String arr = lookupAirportSafe(icao24, pos.getLatitude(), pos.getLongitude());
+                log.info("Landing detected icao24={} airport={}", icao24, arr);
                 state.setPhase(FlightPhase.ON_GROUND);
                 state.reset();
             }
@@ -138,6 +150,7 @@ public class FlightStateMachine
                 state.setTakeoffLat(pos.getLatitude());
                 state.setTakeoffLon(pos.getLongitude());
                 log.info("Takeoff detected icao24={} flightId={}", icao24, flightId);
+                state.setDepartedFrom(lookupAirportSafe(icao24, pos.getLatitude(), pos.getLongitude()));
             }
 
         } else if (phase == FlightPhase.LOST_TRACKING) {
@@ -296,6 +309,9 @@ public class FlightStateMachine
         if (state.getTakeoffMs() != null) {
             builder.setDepartedAtMs(state.getTakeoffMs());
         }
+        if (state.getDepartedFrom() != null) {
+            builder.setDepartedFrom(state.getDepartedFrom());
+        }
 
         if (pos != null) {
             if (pos.getSnapshotTimeMs() != null) builder.setTimestampMs(pos.getSnapshotTimeMs());
@@ -333,6 +349,25 @@ public class FlightStateMachine
             case 2:  return PositionSource.MLAT;
             case 3:  return PositionSource.FLARM;
             default: return PositionSource.POSITION_SOURCE_UNKNOWN;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Airport lookup
+    // ------------------------------------------------------------------
+
+    /**
+     * Wraps {@link AirportLookup#findNearestAirport} with null-safety and
+     * exception handling. Returns {@code null} — rather than propagating — on
+     * any error so a DB outage never fails the Flink job.
+     */
+    private String lookupAirportSafe(String icao24, Double lat, Double lon) {
+        if (lat == null || lon == null) return null;
+        try {
+            return airportLookup.findNearestAirport(lat, lon);
+        } catch (Exception e) {
+            log.warn("Airport lookup failed icao24={}: {}", icao24, e.getMessage());
+            return null;
         }
     }
 

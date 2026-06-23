@@ -48,6 +48,9 @@ public class FlightState implements Serializable {
     private Double takeoffLat;
     private Double takeoffLon;
 
+    /** Airport ICAO ident where this flight originated. Null if unknown or on ground. */
+    private String departedFrom;
+
     // ---- Gap tracking ------------------------------------------------
 
     /** When tracking was lost (ms). Null if not currently lost. */
@@ -78,6 +81,7 @@ public class FlightState implements Serializable {
         takeoffMs = null;
         takeoffLat = null;
         takeoffLon = null;
+        departedFrom = null;
     }
 
     // ------------------------------------------------------------------
@@ -125,6 +129,9 @@ public class FlightState implements Serializable {
 
     public Long getLostTrackingMs() { return lostTrackingMs; }
     public void setLostTrackingMs(Long lostTrackingMs) { this.lostTrackingMs = lostTrackingMs; }
+
+    public String getDepartedFrom() { return departedFrom; }
+    public void setDepartedFrom(String departedFrom) { this.departedFrom = departedFrom; }
 
     public double getAnomalyScore() { return anomalyScore; }
     public void setAnomalyScore(double anomalyScore) { this.anomalyScore = anomalyScore; }
