@@ -11,6 +11,7 @@ and Kafka skills before returning to maritime AIS work.
 air-cargo/
 ├── adsb-collector/    OpenSky REST polling → Kafka
 ├── adsb-analyser/     Flink + SedonaFlink, detection + inference
+├── adsb-tools/        Standalone diagnostic and export utilities
 ├── common/            Shared models, constants, enums
 ├── reference-data/    Airport, operator reference data scripts
 └── k8s/               K3s deployment manifests
@@ -32,10 +33,30 @@ air-cargo/
 - Protobuf — internal Kafka event topics only
 
 ## Infrastructure
-Single node — Minisforum CachyOS.
+Primary development machine: ThinkPad (Linux)
+  Redpanda, PostGIS (Docker), IntelliJ Community
+Secondary machine: used for code-only work without Kafka/PostGIS
+Single node deployment target: Minisforum CachyOS
 No cloud dependency. No always-on requirement.
-Collector runs whenever Minisforum is on.
+Collector runs whenever machine is on.
 Quality of results proportional to uptime — accepted limitation.
+
+## Java 17 / Flink Runtime
+Flink's Kryo serialiser requires --add-opens flags under Java 17.
+These must be set in:
+  IntelliJ Run Configuration → VM options:
+    --add-opens java.base/java.util=ALL-UNNAMED
+    --add-opens java.base/java.lang=ALL-UNNAMED
+    --add-opens java.base/java.lang.reflect=ALL-UNNAMED
+    --add-opens java.base/java.io=ALL-UNNAMED
+    --add-opens java.base/java.net=ALL-UNNAMED
+    --add-opens java.base/java.nio=ALL-UNNAMED
+    --add-opens java.base/sun.nio.ch=ALL-UNNAMED
+    --add-opens java.base/java.util.concurrent=ALL-UNNAMED
+    --add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED
+  Also set in maven-surefire-plugin argLine for tests.
+Jackson must be pinned to 2.14.2 to match Flink 1.19's
+shaded Jackson — do not upgrade.
 
 ## OpenSky Network API
 Base URL: https://opensky-network.org/api
@@ -176,31 +197,62 @@ Gap duration heuristics:
   > 24 hours:  almost certainly landed somewhere
 
 ## Kafka Topics
-  adsb.states          JSON, raw OpenSky snapshots
-  adsb.tracks          Protobuf (PositionUpdate) — enriched, internal
-  adsb.plane_state     Protobuf, current state per aircraft
-                       log compacted — latest value per ICAO24 key
-                       frontend subscribes to this topic
+  adsb.states       JSON, raw OpenSky snapshots
+                    one message per poll, key=snapshot timestamp
+                    30 days retention, delete policy
+                    written by adsb-collector
+                    never transcode or reprocess raw content
+
+  adsb.tracks       Protobuf (PositionUpdate), enriched positions
+                    one message per aircraft per poll
+                    keyed by icao24
+                    30 days retention, delete policy
+                    written by adsb-analyser (Flink)
+                    includes: flight_id, flight_phase,
+                    baro_altitude_m, geo_altitude_m, anomaly_score
+
+  adsb.plane_state  Protobuf (PlaneState), current state per aircraft
+                    log compacted — latest value per ICAO24 key
+                    written by adsb-analyser (Flink)
+                    frontend and diagnostic tools subscribe here
+
+  adsb.flights topic was considered and dropped — lifecycle
+  events are reconstructable from adsb.tracks phase transitions.
+  Completed flight records written to PostgreSQL instead.
 
 ## Serialisation
-- adsb.states: raw JSON string — never transcode or parse in collector
-- adsb.tracks: JSON per AircraftPosition
-- Internal event topics: Protobuf
+- adsb.states: raw JSON string — never transcode in collector
+- adsb.tracks: Protobuf (PositionUpdate)
+- adsb.plane_state: Protobuf (PlaneState)
 - Document state: PostgreSQL JSONB
-- Never transcode raw OpenSky data to Protobuf
-
+- Internal topics always Protobuf, external/raw always JSON
 
 ## Protobuf Messages (adsb-analyser/src/main/proto/aircraft.proto)
-PlaneState:     current state per aircraft → adsb.plane_state
-PositionUpdate: enriched position with flight phase → adsb.tracks
-                (future — adsb.tracks currently JSON AircraftPosition)
+All messages in package io.aircargo.analyser,
+java_package io.aircargo.analyser.proto
+
+PositionUpdate: enriched position → adsb.tracks
+  icao24, flight_id, timestamp_ms
+  latitude, longitude
+  baro_altitude_m (used for flight phase detection)
+  geo_altitude_m  (GPS-derived, preferred for spatial ops)
+  velocity_ms, heading_deg, vertical_rate_ms
+  position_source (PositionSource enum)
+  flight_phase (FlightPhase enum)
+  interpolated, anomaly_score
+
+PlaneState: current state per aircraft → adsb.plane_state
+  icao24, aircraft_type, operator
+  flight_phase, timestamp_ms
+  latitude, longitude, altitude_m, velocity_ms, heading_deg
+  current_flight_id, departed_from, departed_at_ms
+  anomaly_score
 
 Enums:
   FlightPhase: FLIGHT_PHASE_UNKNOWN, AIRBORNE, ON_APPROACH,
                ON_GROUND, LOST_TRACKING
-  PositionSource: POSITION_SOURCE_UNKNOWN, ADS_B, MLAT, 
+  PositionSource: POSITION_SOURCE_UNKNOWN, ADS_B, MLAT,
                   ASTERIX, FLARM
-
 
 ## Key Identifiers
 ICAO24: permanent aircraft identifier, primary key throughout
@@ -208,14 +260,12 @@ ICAO24: permanent aircraft identifier, primary key throughout
 Callsign: changes per flight, not reliable as identifier
           trim whitespace — OpenSky pads to 8 chars
 Registration: tail number, links to external registries
-FlightId: icao24 + takeoff_timestamp — unique per flight
-
+FlightId: icao24 + takeoff_timestamp_ms — unique per flight
 
 ## System-Generated Identifiers
 FlightId, journey_id, anomaly_score, flight_phase — all generated
 by our Flink pipeline. Not sourced from external data.
 FlightId = icao24 + takeoff_timestamp_ms
-
 
 ## Aircraft Categories (extended=1)
   0: No information (very common — most aircraft)
@@ -293,20 +343,38 @@ Military (tracking interest):
    ST_Within(position, sensitive_area_polygon)
    → flag cargo aircraft near military/sanctioned locations
 
-## PostGIS Reference Layers
-  airports              point + polygon, ICAO codes,
-                        field elevation, type, runway geometries
-  cargo_terminals       specific cargo ramp areas
-  airspace_boundaries   FIR boundaries, restricted zones
-  sensitive_locations   military airfields, known grey-market hubs
-                        e.g. Sharjah (OMSJ) flagged
+## PostGIS Schema
+Database: postgres (local Docker, postgis/postgis:16-3.4)
+Connection: localhost:5432, user=postgres, pass=postgres
+Schemas:
+  reference   static reference data loaded from CSVs
+  flights     completed flight records (future)
+  analytics   materialized views, aggregations (future)
 
-## Airport Type for Anomaly Scoring
-  major international   expected for any operator
-  regional commercial   expected for smaller aircraft
-  military              unexpected for civilian — flag
-  private/GA            unexpected for large cargo — flag
-  known grey-market     flag regardless (Sharjah etc.)
+reference schema tables:
+  airports    ~47,000 rows (large/medium/small only)
+              typed columns + JSONB properties
+              geom: geometry(Point, 4326) with GIST index
+              loaded from OurAirports airports.csv
+  runways     ~35,000 rows
+              linked to airports via airport_ident FK
+              includes both runway end headings (le/he)
+              loaded from OurAirports runways.csv
+
+PostGIS Schema Style:
+  Hybrid: typed columns for core fields,
+  JSONB properties column for flexible attributes.
+  GIN index on properties for efficient JSONB queries.
+  Special location attributes (mro, boneyard, grey_market_hub)
+  stored in airports.properties JSONB column.
+
+Airport proximity lookup:
+  AirportLookup class in adsb-analyser
+  JDBC connection opened in Flink open(), closed in close()
+  ST_DWithin with geography cast, threshold 5000m
+  Called on takeoff and landing detection
+  Returns airport ident or null if none within threshold
+  Failures logged as warnings, never fail the Flink job
 
 ## Two-Tier State Management
 Hot tier (Flink RocksDB):
@@ -330,28 +398,31 @@ Cold tier (PostgreSQL JSONB):
 - ST_DistanceSphere for distance calculations
 - Coordinates WGS-84 (EPSG:4326) throughout
 - OpenSky returns longitude (index 5) then latitude (index 6)
-  be explicit when constructing Sedona geometry points
-- Broadcast state for static airport/airspace lookups
+  be explicit when constructing geometry points
 - Altitude always check alongside 2D spatial queries
 
-## Flink Job Structure (adsb-analyser)
-Single Flink job, multiple pipelines from one source:
+## Flink Pipeline (adsb-analyser)
+Single Flink job, AdsbAnalyserMain:
 
   KafkaSource(adsb.states)
-    → flatMap: explode snapshot → AircraftPosition
+    → flatMap SnapshotSplitter: explode → AircraftPosition
     → keyBy(icao24)
-    → Pipeline 1: write to adsb.tracks
-    → Pipeline 2: FlightStateMachine (keyed process function)
-        maintains Flight state per aircraft in RocksDB
-        emits to adsb.flights on state transitions
-        emits to events.anomalies on anomaly detection
-    → Pipeline 3: (future) trade flow inference
+    → FlightStateMachine (KeyedProcessFunction)
+        main output:  PositionUpdate → adsb.tracks
+        side output:  PlaneState → adsb.plane_state
+        maintains FlightState per aircraft in RocksDB
+        calls AirportLookup on takeoff/landing detection
+
+Consumer group: adsb-analyser (bump version suffix on
+  deliberate full replay: adsb-analyser-v2, v3 etc.)
+Starting offsets: OffsetsInitializer.earliest()
 
 ## Anomaly Scoring
 Fuzzy 0.0-1.0 confidence scores throughout.
-No binary thresholds.
-Scores accumulate in per-aircraft Flink state.
-Alert only when score sustained above threshold over time window.
+No binary thresholds. Scores accumulate in per-aircraft
+Flink state. Alert only when score sustained above threshold
+over time window. Currently placeholder (always 0.0) —
+not yet implemented.
 
 ## Catch-up on Restart
 On adsb-collector startup:
@@ -359,41 +430,55 @@ On adsb-collector startup:
   For each watchlisted ICAO24: query /flights/aircraft
   for past 48 hours to recover missed flights
 
+## adsb-tools Module
+Standalone diagnostic and export utilities, no Flink.
+Uses plain kafka-clients KafkaConsumer.
+PlaneStateExporter: reads adsb.plane_state, writes GeoJSON
+  output/plane_state.geojson for QGIS inspection.
+  Use assign() + seekToBeginning() not subscribe() to avoid
+  partition assignment race condition.
+
 ## Design Decisions
-- Flink not Spark — stateful per-aircraft processing,
-  even with 10-15 min polling rhythm
-- Raw JSON preserved in Kafka — never transcode
+- Flink not Spark — stateful per-aircraft processing
+- Raw JSON preserved in adsb.states — never transcode
 - JSONB in PostgreSQL — no MongoDB
 - Independent Maven modules — no parent pom
 - Observational language — never judgemental
 - on_ground unreliable — use heuristics
 - Category field unreliable — use ICAO24 registry lookup
 - 30 day Kafka retention — critical for development replay
+- adsb.flights topic dropped — not needed given adsb.tracks
+  carries full flight_phase history and completed flights
+  are written to PostgreSQL on landing
 
 ## Current Development State
-adsb-collector: ✅ complete, polling every 10 minutes,
-                writing raw snapshots to adsb.states
-common:         ✅ AircraftPosition POJO
-adsb-analyser:  ✅ explode job, Protobuf schemas, compiles
-                not yet tested against live Kafka
-Next milestone: run explode job end-to-end with Redpanda,
-                verify adsb.tracks populated,
-                then implement FlightStateMachine
+adsb-collector:   ✅ complete, polling every 10 minutes,
+                  writing raw snapshots to adsb.states
+common:           ✅ AircraftPosition POJO
+adsb-analyser:    ✅ running end-to-end
+                  ✅ explode job (SnapshotSplitter)
+                  ✅ Protobuf schemas (PositionUpdate, PlaneState)
+                  ✅ FlightStateMachine wired in
+                  ✅ side outputs to adsb.tracks + adsb.plane_state
+                  ✅ AirportLookup via PostGIS JDBC
+                  ✅ departed_from populated on takeoff detection
+                  ✅ landing airport logged on landing detection
+reference-data:   ✅ airports DDL + loaded (~47,000 rows)
+                  ✅ runways DDL + loaded (~35,000 rows)
+                  ✅ OurAirports CSVs committed to repo
+adsb-tools:       ✅ PlaneStateExporter → GeoJSON → QGIS confirmed
+                  ✅ global aircraft distribution visually verified
+                  ✅ ON_GROUND aircraft correctly placed at airports
 
-## PostGIS Schema Style
-Hybrid approach: typed columns for core fields,
-JSONB properties column for flexible attributes.
-GIN index on properties for efficient JSONB queries.
-Special location attributes (mro, boneyard, grey_market_hub)
-stored in airports.properties JSONB column.
-
+## Open / Next Tasks
+- Unit tests need updating — FlightStateMachine rewrite
+  means tests need AirportLookup mocked via constructor injection
+- Anomaly scoring not yet implemented (always 0.0)
+- Runway heading alignment not yet added to approach detection
+- Aircraft metadata registry (FAA/OpenSky CSV load) not started
+- Write completed flight records to PostgreSQL on landing
+- Schema Registry / Redpanda UI proto deserialisation
+  — park until proto schema stable
 
 Always use Plan mode unless explicitly instructed otherwise.
 Do not switch to Agent mode autonomously.
-
-
-Jackson must be pinned to 2.14.2 to match Flink 1.19's shaded Jackson — do not upgrade to 2.17.x
-
-adsb.tracks confirmed working, ~8,150 messages per poll cycle
-
-Next milestone: wire FlightStateMachine, create adsb.plane_state topic
