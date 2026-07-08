@@ -35,7 +35,7 @@ class FlightStateMachineTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        FlightStateMachine fsm = new FlightStateMachine();
+        FlightStateMachine fsm = new FlightStateMachine(new NoOpAirportLookup());
         harness = new KeyedOneInputStreamOperatorTestHarness<>(
                 new KeyedProcessOperator<>(fsm),
                 AircraftPosition::getIcao24,
@@ -214,5 +214,12 @@ class FlightStateMachineTest {
             result.add(r.getValue());
         }
         return result;
+    }
+
+    private static class NoOpAirportLookup implements AirportLookupService {
+        @Override
+        public String findNearestAirport(double lat, double lon) {
+            return null;
+        }
     }
 }

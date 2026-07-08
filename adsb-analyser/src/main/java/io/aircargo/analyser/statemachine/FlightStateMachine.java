@@ -52,7 +52,15 @@ public class FlightStateMachine
     private static final long LOST_TRACKING_AGE_THRESHOLD = 20 * 60 * 1000L;
 
     private ValueState<FlightState> flightStateHandle;
-    private AirportLookup airportLookup;
+    private final AirportLookupService airportLookup;
+
+    public FlightStateMachine() {
+        this.airportLookup = new AirportLookup();
+    }
+
+    public FlightStateMachine(AirportLookupService airportLookup) {
+        this.airportLookup = airportLookup;
+    }
 
     // ------------------------------------------------------------------
     // Lifecycle
@@ -62,7 +70,6 @@ public class FlightStateMachine
     public void open(OpenContext openContext) throws Exception {
         flightStateHandle = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("flight-state", FlightState.class));
-        airportLookup = new AirportLookup();
         airportLookup.open();
     }
 

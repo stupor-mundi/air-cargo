@@ -1,6 +1,5 @@
 package io.aircargo.analyser.statemachine;
 
-import java.io.Serializable;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -12,16 +11,16 @@ import java.sql.SQLException;
  * a given position. Used on takeoff and landing transitions in
  * {@link FlightStateMachine}.
  *
- * <p>Implements {@link Serializable} so Flink can checkpoint the
- * {@link FlightStateMachine} that holds a reference to this object. The JDBC
- * {@link Connection} is {@code transient} and must be re-opened via {@link #open()}
- * after deserialisation (Flink calls {@code open()} on each TaskManager before
- * the operator starts processing).
+ * <p>Implements {@link AirportLookupService} (which extends {@link java.io.Serializable})
+ * so Flink can checkpoint the {@link FlightStateMachine} that holds a reference
+ * to this object. The JDBC {@link Connection} is {@code transient} and must be
+ * re-opened via {@link #open()} after deserialisation (Flink calls {@code open()}
+ * on each TaskManager before the operator starts processing).
  *
  * <p>Airports are expected in the {@code reference.airports} schema. The
  * {@code geom} column must be populated (see {@code 03_load_data.sql}).
  */
-public class AirportLookup implements Serializable {
+public class AirportLookup implements AirportLookupService {
 
     private static final long serialVersionUID = 1L;
 
